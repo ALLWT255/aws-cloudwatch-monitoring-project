@@ -134,13 +134,52 @@ resource "aws_instance" "web_server" {
 
   user_data = <<-EOF
   #!/bin/bash
+  set -euo pipefail
 
-  yum update -y
-  yum install nginx -y
-  yum install amazon-cloudwatch-agent -y
-  systemctl start nginx 
-  systemctl enable nginx
+  dnf install -y nginx amazon-cloudwatch-agent logrotate
+
+  # Grant the agent access without making logs world-readable.
+  usermod -a -G nginx cwagent
+  install -d -o nginx -g nginx -m 2750 /var/log/nginx
+  touch /var/log/nginx/access.log /var/log/nginx/error.log
+  chown nginx:nginx /var/log/nginx/access.log /var/log/nginx/error.log
+  chmod 0640 /var/log/nginx/access.log /var/log/nginx/error.log
+
+  # Preserve agent read access after rotation.
+  cat > /etc/logrotate.d/nginx <<'NGINX_LOGROTATE'
+  /var/log/nginx/*.log {
+      daily
+      rotate 7
+      missingok
+      notifempty
+      compress
+      delaycompress
+      create 0640 nginx nginx
+      sharedscripts
+      postrotate
+          if systemctl is-active --quiet nginx; then
+              /usr/sbin/nginx -s reopen
+          fi
+      endscript
+  }
+  NGINX_LOGROTATE
+
+  # file() preserves placeholders; the quoted heredoc prevents shell expansion.
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-agent.json <<'CWAGENT_CONFIG'
+  ${indent(2, file("${path.module}/cloudwatch-agent.json"))}
+  CWAGENT_CONFIG
+
+  systemctl enable --now nginx
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+      -a fetch-config -m ec2 \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-agent.json -s
+  systemctl enable amazon-cloudwatch-agent
   EOF
+
+  depends_on = [
+    aws_route_table_association.public_assoc,
+    aws_iam_role_policy_attachment.cloudwatch_agent_policy
+  ]
 
   tags = {
     Name = "${var.environment}-web-server"
